@@ -4,133 +4,85 @@ import os
 from fastapi import FastAPI
 import redis.asyncio as redis
 
+from task_service import TaskService
+
 app = FastAPI()
 
 # Redis connection
 redis_client: redis.Redis = None
-QUEUE_KEY = "task_queue"
 
 # Worker identification
 WORKER_NAME = f"worker-{uuid.uuid4().hex[:8]}"
 
-# Semaphore to limit concurrent tasks
+# Concurrency configuration
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
-task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+HIGH_PRIORITY_RESERVED = int(os.getenv("HIGH_PRIORITY_RESERVED", "1"))
+
+# Task services (initialized on startup)
+high_priority: TaskService = None
+low_priority: TaskService = None
 
 
-async def long_running_task(task_id: str):
-    """Executes a long task (waits for 10 seconds)"""
-    # Update task metadata - mark as processing
-    await redis_client.hset(f"task:{task_id}", mapping={
-        "processed_by": WORKER_NAME,
-        "status": "processing"
-    })
-
-    # Get scheduled_by info for logging
-    scheduled_by = await redis_client.hget(f"task:{task_id}", "scheduled_by")
-    scheduled_by = scheduled_by.decode('utf-8') if scheduled_by else "unknown"
-    same_worker = "✓ SAME" if scheduled_by == WORKER_NAME else "✗ DIFFERENT"
-
-    print(f"[{WORKER_NAME}] Task {task_id} started (concurrent tasks: {MAX_CONCURRENT_TASKS - task_semaphore._value})")
-    print(f"[{WORKER_NAME}]   Scheduled by: {scheduled_by} | Processed by: {WORKER_NAME} | {same_worker}")
-
+async def do_work(task_id: str):
+    """The actual work a task performs."""
     await asyncio.sleep(10)
-
-    # Update task metadata - mark as completed
-    await redis_client.hset(f"task:{task_id}", "status", "completed")
-    print(f"[{WORKER_NAME}] Task {task_id} completed")
-
-
-async def execute_task_with_semaphore(task_id: str):
-    """Wrapper that executes task and releases semaphore when done"""
-    try:
-        await long_running_task(task_id)
-    finally:
-        task_semaphore.release()
-        available_slots = task_semaphore._value
-        print(f"[{WORKER_NAME}] available slots = {available_slots}/{MAX_CONCURRENT_TASKS}")
-
-
-
-async def worker():
-    """Worker that reads from the Redis queue and executes tasks"""
-    print(f"[{WORKER_NAME}] Worker started, waiting for tasks...")
-    while True:
-        # Wait until we have capacity (acquire semaphore first)
-        available_slots = task_semaphore._value
-        print(f"[{WORKER_NAME}] Waiting for capacity (available slots: {available_slots}/{MAX_CONCURRENT_TASKS})")
-        await task_semaphore.acquire()
-        print(f"[{WORKER_NAME}] Acquired capacity, checking queue...")
-
-        # Now we have capacity, pop from queue
-        result = await redis_client.brpop(QUEUE_KEY, timeout=0)
-        if result:
-            _, task_id = result
-            task_id = task_id.decode('utf-8')
-            print(f"[{WORKER_NAME}] Picked up task {task_id} from Redis queue")
-            # Execute task in background, will release semaphore when done
-            asyncio.create_task(execute_task_with_semaphore(task_id))
-        else:
-            # No task available (shouldn't happen with timeout=0), release semaphore
-            task_semaphore.release()
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize Redis and start the worker when the app starts"""
-    global redis_client
+    global redis_client, high_priority, low_priority
+
     redis_client = await redis.from_url("redis://localhost:6379", decode_responses=False)
     print(f"[{WORKER_NAME}] Connected to Redis")
     print(f"[{WORKER_NAME}] Max concurrent tasks: {MAX_CONCURRENT_TASKS}")
-    asyncio.create_task(worker())
+    print(f"[{WORKER_NAME}] High priority reserved slots: {HIGH_PRIORITY_RESERVED}")
+    print(f"[{WORKER_NAME}] Low priority max slots: {MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED}")
+
+    high_priority = TaskService(
+        name="high",
+        queue_key="high_priority_queue",
+        max_concurrent=MAX_CONCURRENT_TASKS,
+        redis_client=redis_client,
+        worker_name=WORKER_NAME,
+        handler=do_work,
+    )
+    low_priority = TaskService(
+        name="low",
+        queue_key="low_priority_queue",
+        max_concurrent=MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED,
+        redis_client=redis_client,
+        worker_name=WORKER_NAME,
+        handler=do_work,
+    )
+
+    asyncio.create_task(high_priority.worker())
+    asyncio.create_task(low_priority.worker())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Close Redis connection on shutdown"""
     if redis_client:
         await redis_client.close()
         print(f"[{WORKER_NAME}] Redis connection closed")
 
 
-@app.get("/uuid")
-async def get_uuid():
-    return {"uuid": str(uuid.uuid4())}
-
-
 @app.get("/task")
-async def start_task():
-    """Endpoint to add a task to the Redis queue"""
+async def start_task(priority: str = "low"):
     task_id = str(uuid.uuid4())
-
-    # Store task metadata
-    await redis_client.hset(f"task:{task_id}", mapping={
-        "task_id": task_id,
-        "scheduled_by": WORKER_NAME,
-        "status": "queued"
-    })
-
-    # Add to queue
-    await redis_client.lpush(QUEUE_KEY, task_id)
-    print(f"Task {task_id} added to Redis queue")
-    return {"task_id": task_id, "status": "queued", "worker": WORKER_NAME}
+    if priority not in ("high", "low"):
+        priority = "low"
+    service = high_priority if priority == "high" else low_priority
+    return await service.schedule(task_id)
 
 
 @app.get("/task/{task_id}")
 async def get_task_status(task_id: str):
-    """Get task status and worker information"""
     task_data = await redis_client.hgetall(f"task:{task_id}")
-
     if not task_data:
         return {"error": "Task not found"}
-
-    # Decode bytes to strings
-    result = {k.decode('utf-8'): v.decode('utf-8') for k, v in task_data.items()}
-
-    # Add comparison
+    result = {k.decode("utf-8"): v.decode("utf-8") for k, v in task_data.items()}
     if "scheduled_by" in result and "processed_by" in result:
         result["same_worker"] = result["scheduled_by"] == result["processed_by"]
-
     return result
 
 

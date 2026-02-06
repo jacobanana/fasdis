@@ -1,0 +1,127 @@
+import asyncio
+from datetime import datetime, timezone
+from typing import Callable, Awaitable
+
+import redis.asyncio as redis
+
+
+class TaskService:
+    """Generic queue-backed task service with concurrency control.
+
+    Instantiate once per priority level, pointing at different Redis queues
+    and concurrency limits. The actual work is delegated to a handler callback.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        queue_key: str,
+        max_concurrent: int,
+        redis_client: redis.Redis,
+        worker_name: str,
+        handler: Callable[[str], Awaitable[None]],
+    ):
+        self.name = name
+        self.queue_key = queue_key
+        self.max_concurrent = max_concurrent
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.redis_client = redis_client
+        self.worker_name = worker_name
+        self.handler = handler
+
+    async def schedule(self, task_id: str) -> dict:
+        """Push a task onto this service's queue and store its metadata."""
+        scheduled_at = datetime.now(timezone.utc).isoformat()
+        await self.redis_client.hset(f"task:{task_id}", mapping={
+            "task_id": task_id,
+            "scheduled_by": self.worker_name,
+            "scheduled_at": scheduled_at,
+            "priority": self.name.lower(),
+            "status": "queued",
+        })
+        await self.redis_client.lpush(self.queue_key, task_id)
+        print(f"[{self.name.upper()}] Task {task_id} added to Redis queue at {scheduled_at}")
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "priority": self.name.lower(),
+            "worker": self.worker_name,
+            "scheduled_at": scheduled_at,
+        }
+
+    async def _execute_task(self, task_id: str):
+        """Run the full task lifecycle: metadata tracking, handler, completion."""
+        start_time = datetime.now(timezone.utc).isoformat()
+
+        scheduled_at = await self.redis_client.hget(f"task:{task_id}", "scheduled_at")
+        if scheduled_at:
+            scheduled_at_dt = datetime.fromisoformat(scheduled_at.decode("utf-8"))
+            latency_ms = (datetime.now(timezone.utc) - scheduled_at_dt).total_seconds() * 1000
+        else:
+            latency_ms = 0
+
+        await self.redis_client.hset(f"task:{task_id}", mapping={
+            "processed_by": self.worker_name,
+            "status": "processing",
+            "started_at": start_time,
+            "latency_ms": str(latency_ms),
+        })
+
+        scheduled_by = await self.redis_client.hget(f"task:{task_id}", "scheduled_by")
+        scheduled_by = scheduled_by.decode("utf-8") if scheduled_by else "unknown"
+        same_worker = "SAME" if scheduled_by == self.worker_name else "DIFFERENT"
+
+        running = self.max_concurrent - self.semaphore._value
+        print(
+            f"[{self.worker_name}] [{self.name.upper()}] Task {task_id} started "
+            f"(running: {running}/{self.max_concurrent}) | Latency: {latency_ms:.2f}ms"
+        )
+        print(
+            f"[{self.worker_name}]   Scheduled by: {scheduled_by} "
+            f"| Processed by: {self.worker_name} | {same_worker}"
+        )
+
+        await self.handler(task_id)
+
+        completed_at = datetime.now(timezone.utc).isoformat()
+        await self.redis_client.hset(f"task:{task_id}", mapping={
+            "status": "completed",
+            "completed_at": completed_at,
+        })
+        print(f"[{self.worker_name}] [{self.name.upper()}] Task {task_id} completed")
+
+    async def _execute_with_semaphore(self, task_id: str):
+        """Wrapper that releases the semaphore when the task finishes."""
+        try:
+            await self._execute_task(task_id)
+        finally:
+            self.semaphore.release()
+            available = self.semaphore._value
+            print(
+                f"[{self.worker_name}] {self.name} slots available = "
+                f"{available}/{self.max_concurrent}"
+            )
+
+    async def worker(self):
+        """Main loop: acquire a concurrency slot, pop from queue, execute."""
+        print(f"[{self.worker_name}] {self.name} worker started, waiting for tasks...")
+        while True:
+            available = self.semaphore._value
+            print(
+                f"[{self.worker_name}] [{self.name.upper()}] Waiting for capacity "
+                f"(available slots: {available}/{self.max_concurrent})"
+            )
+            await self.semaphore.acquire()
+            print(f"[{self.worker_name}] [{self.name.upper()}] Acquired capacity, checking queue...")
+
+            result = await self.redis_client.brpop(self.queue_key, timeout=0)
+            if result:
+                _, task_id = result
+                task_id = task_id.decode("utf-8")
+                print(
+                    f"[{self.worker_name}] [{self.name.upper()}] "
+                    f"Picked up task {task_id} from Redis queue"
+                )
+                asyncio.create_task(self._execute_with_semaphore(task_id))
+            else:
+                self.semaphore.release()
