@@ -1,8 +1,13 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Callable, Awaitable
 
 import redis.asyncio as redis
+
+from log import ctx_service, ctx_task_id
+
+logger = logging.getLogger("fastdis.task_service")
 
 
 class TaskService:
@@ -29,8 +34,13 @@ class TaskService:
         self.worker_name = worker_name
         self.handler = handler
 
+    def _set_context(self):
+        ctx_service.set(self.name.upper())
+
     async def schedule(self, task_id: str) -> dict:
         """Push a task onto this service's queue and store its metadata."""
+        self._set_context()
+        ctx_task_id.set(task_id[:6])
         scheduled_at = datetime.now(timezone.utc).isoformat()
         await self.redis_client.hset(f"task:{task_id}", mapping={
             "task_id": task_id,
@@ -40,7 +50,7 @@ class TaskService:
             "status": "queued",
         })
         await self.redis_client.lpush(self.queue_key, task_id)
-        print(f"[{self.name.upper()}] Task {task_id} added to Redis queue at {scheduled_at}")
+        logger.info("Added to Redis queue at %s", scheduled_at)
         return {
             "task_id": task_id,
             "status": "queued",
@@ -72,13 +82,13 @@ class TaskService:
         same_worker = "SAME" if scheduled_by == self.worker_name else "DIFFERENT"
 
         running = self.max_concurrent - self.semaphore._value
-        print(
-            f"[{self.worker_name}] [{self.name.upper()}] Task {task_id} started "
-            f"(running: {running}/{self.max_concurrent}) | Latency: {latency_ms:.2f}ms"
+        logger.info(
+            "Started (running: %d/%d) | Latency: %.2fms",
+            running, self.max_concurrent, latency_ms,
         )
-        print(
-            f"[{self.worker_name}]   Scheduled by: {scheduled_by} "
-            f"| Processed by: {self.worker_name} | {same_worker}"
+        logger.info(
+            "  Scheduled by: %s | Processed by: %s | %s",
+            scheduled_by, self.worker_name, same_worker,
         )
 
         await self.handler(task_id)
@@ -88,40 +98,39 @@ class TaskService:
             "status": "completed",
             "completed_at": completed_at,
         })
-        print(f"[{self.worker_name}] [{self.name.upper()}] Task {task_id} completed")
+        logger.info("Completed")
 
     async def _execute_with_semaphore(self, task_id: str):
         """Wrapper that releases the semaphore when the task finishes."""
+        self._set_context()
+        ctx_task_id.set(task_id[:6])
         try:
             await self._execute_task(task_id)
         finally:
             self.semaphore.release()
             available = self.semaphore._value
-            print(
-                f"[{self.worker_name}] {self.name} slots available = "
-                f"{available}/{self.max_concurrent}"
+            logger.info(
+                "Slots available = %d/%d", available, self.max_concurrent,
             )
 
     async def worker(self):
         """Main loop: acquire a concurrency slot, pop from queue, execute."""
-        print(f"[{self.worker_name}] {self.name} worker started, waiting for tasks...")
+        self._set_context()
+        logger.info("Worker started, waiting for tasks...")
         while True:
             available = self.semaphore._value
-            print(
-                f"[{self.worker_name}] [{self.name.upper()}] Waiting for capacity "
-                f"(available slots: {available}/{self.max_concurrent})"
+            logger.info(
+                "Waiting for capacity (available slots: %d/%d)",
+                available, self.max_concurrent,
             )
             await self.semaphore.acquire()
-            print(f"[{self.worker_name}] [{self.name.upper()}] Acquired capacity, checking queue...")
+            logger.info("Acquired capacity, checking queue...")
 
             result = await self.redis_client.brpop(self.queue_key, timeout=0)
             if result:
                 _, task_id = result
                 task_id = task_id.decode("utf-8")
-                print(
-                    f"[{self.worker_name}] [{self.name.upper()}] "
-                    f"Picked up task {task_id} from Redis queue"
-                )
+                logger.info("Picked up task %s from queue", task_id[:6])
                 asyncio.create_task(self._execute_with_semaphore(task_id))
             else:
                 self.semaphore.release()

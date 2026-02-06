@@ -1,12 +1,16 @@
 import uuid
 import asyncio
+import logging
 import os
 from fastapi import FastAPI
 import redis.asyncio as redis
 
+import log
 from task_service import TaskService
 
 app = FastAPI()
+
+logger = logging.getLogger("fastdis.main")
 
 # Redis connection
 redis_client: redis.Redis = None
@@ -32,11 +36,13 @@ async def do_work(task_id: str):
 async def startup_event():
     global redis_client, high_priority, low_priority
 
+    log.setup(WORKER_NAME)
+
     redis_client = await redis.from_url("redis://localhost:6379", decode_responses=False)
-    print(f"[{WORKER_NAME}] Connected to Redis")
-    print(f"[{WORKER_NAME}] Max concurrent tasks: {MAX_CONCURRENT_TASKS}")
-    print(f"[{WORKER_NAME}] High priority reserved slots: {HIGH_PRIORITY_RESERVED}")
-    print(f"[{WORKER_NAME}] Low priority max slots: {MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED}")
+    logger.info("Connected to Redis")
+    logger.info("Max concurrent tasks: %d", MAX_CONCURRENT_TASKS)
+    logger.info("High priority reserved slots: %d", HIGH_PRIORITY_RESERVED)
+    logger.info("Low priority max slots: %d", MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED)
 
     high_priority = TaskService(
         name="high",
@@ -63,7 +69,7 @@ async def startup_event():
 async def shutdown_event():
     if redis_client:
         await redis_client.close()
-        print(f"[{WORKER_NAME}] Redis connection closed")
+        logger.info("Redis connection closed")
 
 
 @app.get("/task")
