@@ -48,7 +48,6 @@ class TaskService:
         if task_id not in self.records:
             existing = await self.redis_client.hgetall(key)
             if existing:
-                existing = {k.decode("utf-8"): v.decode("utf-8") for k, v in existing.items()}
                 content = {**existing, **content}
             self.records[task_id] = TaskRecord(**content)
         else:
@@ -91,7 +90,7 @@ class TaskService:
 
         scheduled_at = await self.redis_client.hget(f"task:{task_id}", "scheduled_at")
         if scheduled_at:
-            scheduled_at_dt = datetime.fromisoformat(scheduled_at.decode("utf-8"))
+            scheduled_at_dt = datetime.fromisoformat(scheduled_at)
             latency_ms = (start_time - scheduled_at_dt).total_seconds() * 1000
         else:
             latency_ms = 0
@@ -106,7 +105,7 @@ class TaskService:
         await self.set_task_record(task_id, record)
 
         scheduled_by = await self.redis_client.hget(f"task:{task_id}", "scheduled_by")
-        scheduled_by = scheduled_by.decode("utf-8") if scheduled_by else "unknown"
+        scheduled_by = scheduled_by if scheduled_by else "unknown"
         same_worker = "SAME" if scheduled_by == self.worker_name else "DIFFERENT"
 
         running = self.max_concurrent - self.semaphore._value
@@ -119,16 +118,20 @@ class TaskService:
             scheduled_by, self.worker_name, same_worker,
         )
 
-        await self.handler(task_id)
-
-        completed_at = datetime.now(timezone.utc)
-
-        record = {
-            "status": TaskStatus.COMPLETED,
-            "completed_at": completed_at,
-        }
-        await self.set_task_record(task_id, record)
-        logger.info("Completed")
+        try:
+            await self.handler(task_id)
+            status = TaskStatus.COMPLETED
+        except Exception as exc:
+            logger.exception("Task failed")
+            status = TaskStatus.FAILED
+        finally:
+            completed_at = datetime.now(timezone.utc)
+            record = {
+                "status": status,
+                "completed_at": completed_at,
+            }
+            await self.set_task_record(task_id, record)
+            logger.info(status.value)
 
 
     async def _execute_with_semaphore(self, task_id: str):
@@ -161,7 +164,6 @@ class TaskService:
             result = await self.redis_client.brpop(self.queue_key, timeout=0)
             if result:
                 _, task_id = result
-                task_id = task_id.decode("utf-8")
                 logger.info("Picked up task %s from queue", task_id[:6])
                 asyncio.create_task(self._execute_with_semaphore(task_id))
             else:

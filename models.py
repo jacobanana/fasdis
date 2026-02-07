@@ -13,6 +13,7 @@ class TaskStatus(StrEnum):
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class TaskRecord(BaseModel):
@@ -28,12 +29,6 @@ class TaskRecord(BaseModel):
 
     def to_redis(self) -> dict[str, str]:
         return self.model_dump(mode="json", exclude_none=True)
-
-    # def to_redis(self) -> dict[str, str]:
-    #     return {
-    #         k: str(v)
-    #         for k, v in self.model_dump(mode="json", exclude_none=True).items()
-    #     }
 
 
 class ScheduleResponse(BaseModel):

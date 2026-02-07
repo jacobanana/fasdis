@@ -35,11 +35,11 @@ async def do_work(task_id: str):
 
 @app.on_event("startup")
 async def startup_event():
-    global redis_client, high_priority, low_priority
+    global redis_client, high_priority, low_priority, worker_tasks
 
     log.setup(WORKER_NAME)
 
-    redis_client = await redis.from_url("redis://localhost:6379", decode_responses=False)
+    redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
     logger.info("Connected to Redis")
     logger.info("Max concurrent tasks: %d", MAX_CONCURRENT_TASKS)
     logger.info("High priority reserved slots: %d", HIGH_PRIORITY_RESERVED)
@@ -62,8 +62,10 @@ async def startup_event():
         handler=do_work,
     )
 
-    asyncio.create_task(high_priority.worker())
-    asyncio.create_task(low_priority.worker())
+    worker_tasks = []
+
+    worker_tasks.append(asyncio.create_task(high_priority.worker()))
+    worker_tasks.append(asyncio.create_task(low_priority.worker()))
 
 
 @app.on_event("shutdown")
@@ -71,6 +73,10 @@ async def shutdown_event():
     if redis_client:
         await redis_client.close()
         logger.info("Redis connection closed")
+
+    for task in worker_tasks:
+        task.cancel()
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
 
 @app.get("/task")
@@ -85,8 +91,7 @@ async def get_task_status(task_id: str):
     task_data = await redis_client.hgetall(f"task:{task_id}")
     if not task_data:
         return {"error": "Task not found"}
-    data = {k.decode("utf-8"): v.decode("utf-8") for k, v in task_data.items()}
-    return TaskStatusResponse.model_validate(data)
+    return TaskStatusResponse.model_validate(task_data)
 
 
 if __name__ == "__main__":
