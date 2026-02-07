@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Any
 
 import redis.asyncio as redis
 
@@ -34,24 +34,46 @@ class TaskService:
         self.redis_client = redis_client
         self.worker_name = worker_name
         self.handler = handler
+        self.records: dict[str, TaskRecord] = dict()
 
-    def _set_context(self):
+    def _set_context(self, task_id: str | None = None):
         ctx_service.set(self.priority.value.upper())
+        if task_id:
+            ctx_task_id.set(task_id[:6])
+
+    async def set_task_record(self, task_id: str, content: dict[str, Any]) -> None:
+        """Set or update a task record in redis"""
+        key = f"task:{task_id}"
+
+        if task_id not in self.records:
+            existing = await self.redis_client.hgetall(key)
+            if existing:
+                existing = {k.decode("utf-8"): v.decode("utf-8") for k, v in existing.items()}
+                content = {**existing, **content}
+            self.records[task_id] = TaskRecord(**content)
+        else:
+            self.records[task_id] = self.records[task_id].copy(update=content)
+
+        async with self.redis_client.pipeline(transaction=True) as pipe:
+            await pipe.hset(key, mapping=self.records[task_id].to_redis())
+            await pipe.expire(key, 3600)
+            await pipe.execute()
 
     async def schedule(self, task_id: str) -> ScheduleResponse:
         """Push a task onto this service's queue and store its metadata."""
-        self._set_context()
-        ctx_task_id.set(task_id[:6])
+        self._set_context(task_id)
+        
         now = datetime.now(timezone.utc)
+        
+        record = {
+            "task_id": task_id,
+            "priority": self.priority,
+            "status": TaskStatus.QUEUED,
+            "scheduled_by": self.worker_name,
+            "scheduled_at": now,
+        }
 
-        record = TaskRecord(
-            task_id=task_id,
-            priority=self.priority,
-            status=TaskStatus.QUEUED,
-            scheduled_by=self.worker_name,
-            scheduled_at=now,
-        )
-        await self.redis_client.hset(f"task:{task_id}", mapping=record.to_redis())
+        await self.set_task_record(task_id, record)
         await self.redis_client.lpush(self.queue_key, task_id)
         logger.info("Added to Redis queue at %s", now.isoformat())
 
@@ -74,12 +96,14 @@ class TaskService:
         else:
             latency_ms = 0
 
-        await self.redis_client.hset(f"task:{task_id}", mapping={
+        record = {
             "processed_by": self.worker_name,
             "status": TaskStatus.PROCESSING,
-            "started_at": start_time.isoformat(),
-            "latency_ms": str(latency_ms),
-        })
+            "started_at": start_time,
+            "latency_ms": latency_ms,
+        }
+
+        await self.set_task_record(task_id, record)
 
         scheduled_by = await self.redis_client.hget(f"task:{task_id}", "scheduled_by")
         scheduled_by = scheduled_by.decode("utf-8") if scheduled_by else "unknown"
@@ -98,20 +122,24 @@ class TaskService:
         await self.handler(task_id)
 
         completed_at = datetime.now(timezone.utc)
-        await self.redis_client.hset(f"task:{task_id}", mapping={
+
+        record = {
             "status": TaskStatus.COMPLETED,
-            "completed_at": completed_at.isoformat(),
-        })
+            "completed_at": completed_at,
+        }
+        await self.set_task_record(task_id, record)
         logger.info("Completed")
+
 
     async def _execute_with_semaphore(self, task_id: str):
         """Wrapper that releases the semaphore when the task finishes."""
-        self._set_context()
-        ctx_task_id.set(task_id[:6])
+        self._set_context(task_id[:6])
         try:
             await self._execute_task(task_id)
         finally:
+            self.records.pop(task_id, None)
             self.semaphore.release()
+
             available = self.semaphore._value
             logger.info(
                 "Slots available = %d/%d", available, self.max_concurrent,

@@ -27,10 +27,13 @@ class TaskRecord(BaseModel):
     latency_ms: float | None = None
 
     def to_redis(self) -> dict[str, str]:
-        return {
-            k: str(v)
-            for k, v in self.model_dump(mode="json", exclude_none=True).items()
-        }
+        return self.model_dump(mode="json", exclude_none=True)
+
+    # def to_redis(self) -> dict[str, str]:
+    #     return {
+    #         k: str(v)
+    #         for k, v in self.model_dump(mode="json", exclude_none=True).items()
+    #     }
 
 
 class ScheduleResponse(BaseModel):
