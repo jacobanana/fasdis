@@ -6,6 +6,7 @@ from fastapi import FastAPI
 import redis.asyncio as redis
 
 import log
+from models import Priority, TaskStatusResponse
 from task_service import TaskService
 
 app = FastAPI()
@@ -45,7 +46,7 @@ async def startup_event():
     logger.info("Low priority max slots: %d", MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED)
 
     high_priority = TaskService(
-        name="high",
+        priority=Priority.HIGH,
         queue_key="high_priority_queue",
         max_concurrent=MAX_CONCURRENT_TASKS,
         redis_client=redis_client,
@@ -53,7 +54,7 @@ async def startup_event():
         handler=do_work,
     )
     low_priority = TaskService(
-        name="low",
+        priority=Priority.LOW,
         queue_key="low_priority_queue",
         max_concurrent=MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED,
         redis_client=redis_client,
@@ -73,11 +74,9 @@ async def shutdown_event():
 
 
 @app.get("/task")
-async def start_task(priority: str = "low"):
+async def start_task(priority: Priority = Priority.LOW):
     task_id = str(uuid.uuid4())
-    if priority not in ("high", "low"):
-        priority = "low"
-    service = high_priority if priority == "high" else low_priority
+    service = high_priority if priority == Priority.HIGH else low_priority
     return await service.schedule(task_id)
 
 
@@ -86,10 +85,8 @@ async def get_task_status(task_id: str):
     task_data = await redis_client.hgetall(f"task:{task_id}")
     if not task_data:
         return {"error": "Task not found"}
-    result = {k.decode("utf-8"): v.decode("utf-8") for k, v in task_data.items()}
-    if "scheduled_by" in result and "processed_by" in result:
-        result["same_worker"] = result["scheduled_by"] == result["processed_by"]
-    return result
+    data = {k.decode("utf-8"): v.decode("utf-8") for k, v in task_data.items()}
+    return TaskStatusResponse.model_validate(data)
 
 
 if __name__ == "__main__":
