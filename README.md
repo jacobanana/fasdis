@@ -67,18 +67,31 @@ while True:
     asyncio.create_task(execute)  # 3. run and loop back
 ```
 
-The alternative would be to acquire semaphores first, then pop (acquire-then-BRPOP).
+The alternative would be acquire-then-BRPOP (acquire capacity first, then pop).
 The choice between the two is a deliberate tradeoff:
 
-**Acquire-then-BRPOP** — the worker holds a `global_sem` slot while blocked on
-an empty queue. If no high priority tasks arrive, one global slot is permanently
-occupied by the idle high-priority worker, reducing effective capacity for low
-priority. With a shared global semaphore this is unacceptable: an idle high
-worker would silently reduce the system to `MAX - 1` effective slots.
+**Acquire-then-BRPOP** — the worker holds semaphore slots while blocked on an
+empty queue. At first glance the high priority worker holding 1 `global_sem`
+slot seems fine — it's the "reserved" slot. But the low priority worker *also*
+holds 1 `global_sem` slot while idle. With two worker loops sharing `global_sem`,
+2 of the 3 slots are permanently held by idle workers, leaving only 1 slot for
+actual task execution. The idle cost compounds across worker loops sharing the
+same semaphore, severely reducing effective capacity:
+
+| Component                 | global_sem held | Purpose          |
+|---------------------------|-----------------|------------------|
+| High worker (idle)        | 1               | Reserved slot    |
+| Low worker (idle)         | 1               | Wasted           |
+| **Remaining for tasks**   | **1**           |                  |
 
 **BRPOP-then-acquire** (chosen) — the worker only holds semaphore slots while a
-task is actually running. No capacity is wasted on idle workers. The cost is a
-"task-in-limbo" edge case in multi-instance deployments (see below).
+task is actually executing. No capacity is consumed by idle workers, so all
+`MAX_CONCURRENT_TASKS` slots are available for real work. The cost is a
+"task-in-limbo" edge case in multi-instance deployments: a worker pops a task
+from Redis (removing it from the shared queue), then blocks on local semaphore
+acquisition while another instance with free capacity cannot help. This is
+bounded — at most 1 task per worker loop (2 per instance), with delay bounded
+by the duration of the shortest running task on that instance.
 
 ### Multi-Instance Behavior
 
@@ -93,11 +106,11 @@ exactly one instance receives each task. The semaphores are `asyncio.Semaphore`
 
 **Task-in-limbo edge case**: Because the worker pops before acquiring a
 semaphore, a task can be removed from Redis and then block waiting for local
-capacity — while another instance with free slots cannot help (the task is
-already gone from Redis). This is bounded: at most one task per worker loop
-(two per instance) can be in limbo, and the delay is bounded by the duration of
-the shortest running task on that instance. This is a significantly better
-tradeoff than the permanent slot waste of the acquire-first alternative.
+capacity — while another instance with free slots cannot help. This is bounded:
+at most one task per worker loop (two per instance) can be in limbo, and the
+delay is bounded by the duration of the shortest running task on that instance.
+This is a significantly better tradeoff than the permanent capacity loss of the
+acquire-first alternative, where idle workers consume shared semaphore slots.
 
 ## Configuration
 
