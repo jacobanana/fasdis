@@ -33,8 +33,8 @@ The high priority worker acquires only `global_sem`. The low priority worker
 acquires `low_priority_cap` first, then `global_sem`.
 
 ```
-High worker:   BRPOP(high_queue) -> acquire(global_sem)                    -> execute
-Low worker:    BRPOP(low_queue)  -> acquire(low_priority_cap, global_sem)  -> execute
+High worker:   acquire(global_sem)                    -> BRPOP(high_queue) -> execute
+Low worker:    acquire(low_priority_cap, global_sem)  -> BRPOP(low_queue)  -> execute
 ```
 
 This produces the following behavior (example: MAX=3, RESERVED=1):
@@ -55,30 +55,40 @@ This produces the following behavior (example: MAX=3, RESERVED=1):
 - High priority only needs `global_sem`, so it can use the full capacity when
   low priority workers are idle.
 
-### Worker Loop Order: BRPOP-then-Acquire
+### Worker Loop Order: Acquire-then-BRPOP
 
-The worker loop pops a task from Redis *before* acquiring semaphores:
+The worker loop acquires semaphore slots *before* popping a task from Redis:
 
 ```python
 while True:
-    task = BRPOP(queue)           # 1. wait for a task (blocking)
     for sem in semaphores:
-        await sem.acquire()       # 2. wait for capacity
+        await sem.acquire()       # 1. wait for capacity
+    task = BRPOP(queue)           # 2. wait for a task (blocking)
     asyncio.create_task(execute)  # 3. run and loop back
 ```
 
-The alternative would be to acquire semaphores first, then pop (acquire-then-BRPOP).
+The alternative would be BRPOP-then-acquire (pop first, then wait for capacity).
 The choice between the two is a deliberate tradeoff:
 
-**Acquire-then-BRPOP** — the worker holds a `global_sem` slot while blocked on
-an empty queue. If no high priority tasks arrive, one global slot is permanently
-occupied by the idle high-priority worker, reducing effective capacity for low
-priority. With a shared global semaphore this is unacceptable: an idle high
-worker would silently reduce the system to `MAX - 1` effective slots.
+**Acquire-then-BRPOP** (chosen) — the worker holds a `global_sem` slot while
+blocked on an empty queue. For the high priority worker, this means 1 global
+slot is held while waiting for work. This is actually desirable: the held slot
+*is* the reserved slot. The high priority worker pre-claims its reserved
+capacity, so when a high priority task arrives it can execute immediately with
+zero semaphore acquisition latency. Low priority effective capacity is
+`MAX - RESERVED` regardless — the same limit enforced by `low_priority_cap` —
+so no usable capacity is lost. In a multi-instance deployment, tasks stay in
+Redis until a worker with confirmed capacity pops them, so any instance with
+free slots can pick up the work.
 
-**BRPOP-then-acquire** (chosen) — the worker only holds semaphore slots while a
-task is actually running. No capacity is wasted on idle workers. The cost is a
-"task-in-limbo" edge case in multi-instance deployments (see below).
+**BRPOP-then-acquire** — the worker only holds semaphore slots while a task is
+actually running, so no capacity is held by idle workers. However, this creates
+a "task-in-limbo" problem in multi-instance deployments: a worker pops a task
+from Redis (removing it from the shared queue), then blocks on local semaphore
+acquisition. The task is now stuck in one instance's memory while another
+instance with free capacity cannot help. This is bounded (at most 1 task per
+worker loop) but unnecessary given that the acquire-first pattern's "cost" is
+holding the reserved slot — which is the intended behavior anyway.
 
 ### Multi-Instance Behavior
 
@@ -91,13 +101,10 @@ exactly one instance receives each task. The semaphores are `asyncio.Semaphore`
   `HIGH_PRIORITY_RESERVED` slots for high priority and enforces its own hard
   limit. The system-wide invariant holds in aggregate.
 
-**Task-in-limbo edge case**: Because the worker pops before acquiring a
-semaphore, a task can be removed from Redis and then block waiting for local
-capacity — while another instance with free slots cannot help (the task is
-already gone from Redis). This is bounded: at most one task per worker loop
-(two per instance) can be in limbo, and the delay is bounded by the duration of
-the shortest running task on that instance. This is a significantly better
-tradeoff than the permanent slot waste of the acquire-first alternative.
+Because the worker acquires semaphores before popping, tasks remain in Redis
+until a worker with confirmed local capacity takes them. This means work
+naturally distributes to instances that have available slots, avoiding the
+task-in-limbo problem entirely.
 
 ## Configuration
 
