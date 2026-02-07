@@ -48,9 +48,13 @@ async def startup_event():
     logger.info("High priority reserved slots: %d", HIGH_PRIORITY_RESERVED)
     logger.info("Low priority max slots: %d", MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED)
 
+    global_sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+    low_priority_cap = asyncio.Semaphore(MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED)
+
     high_priority = TaskService(
         priority=Priority.HIGH,
         queue_key="high_priority_queue",
+        semaphores=[global_sem],
         max_concurrent=MAX_CONCURRENT_TASKS,
         redis_client=redis_client,
         worker_name=WORKER_NAME,
@@ -59,7 +63,8 @@ async def startup_event():
     low_priority = TaskService(
         priority=Priority.LOW,
         queue_key="low_priority_queue",
-        max_concurrent=MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED, # this technically allows for more than MAX_CONCURRENCY tasks to run at once
+        semaphores=[low_priority_cap, global_sem],
+        max_concurrent=MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED,
         redis_client=redis_client,
         worker_name=WORKER_NAME,
         handler=do_work,

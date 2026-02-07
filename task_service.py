@@ -14,14 +14,16 @@ logger = logging.getLogger("fastdis.task_service")
 class TaskService:
     """Generic queue-backed task service with concurrency control.
 
-    Instantiate once per priority level, pointing at different Redis queues
-    and concurrency limits. The actual work is delegated to a handler callback.
+    Instantiate once per priority level, pointing at different Redis queues.
+    Concurrency is controlled by externally provided semaphores, allowing
+    a shared global limit with per-priority caps.
     """
 
     def __init__(
         self,
         priority: Priority,
         queue_key: str,
+        semaphores: list[asyncio.Semaphore],
         max_concurrent: int,
         redis_client: redis.Redis,
         worker_name: str,
@@ -29,8 +31,8 @@ class TaskService:
     ):
         self.priority = priority
         self.queue_key = queue_key
+        self.semaphores = semaphores
         self.max_concurrent = max_concurrent
-        self.semaphore = asyncio.Semaphore(max_concurrent)
         self.redis_client = redis_client
         self.worker_name = worker_name
         self.handler = handler
@@ -108,7 +110,7 @@ class TaskService:
         scheduled_by = scheduled_by if scheduled_by else "unknown"
         same_worker = "SAME" if scheduled_by == self.worker_name else "DIFFERENT"
 
-        running = self.max_concurrent - self.semaphore._value
+        running = self.max_concurrent - self.semaphores[0]._value
         logger.info(
             "Started (running: %d/%d) | Latency: %.2fms",
             running, self.max_concurrent, latency_ms,
@@ -135,36 +137,39 @@ class TaskService:
 
 
     async def _execute_with_semaphore(self, task_id: str):
-        """Wrapper that releases the semaphore when the task finishes."""
+        """Wrapper that releases all semaphores when the task finishes."""
         self._set_context(task_id[:6])
         try:
             await self._execute_task(task_id)
         finally:
             self.records.pop(task_id, None)
-            self.semaphore.release()
+            for sem in reversed(self.semaphores):
+                sem.release()
 
-            available = self.semaphore._value
+            available = self.semaphores[0]._value
             logger.info(
                 "Slots available = %d/%d", available, self.max_concurrent,
             )
 
     async def worker(self):
-        """Main loop: acquire a concurrency slot, pop from queue, execute."""
+        """Main loop: pop from queue, acquire concurrency slots, execute."""
         self._set_context()
         logger.info("Worker started, waiting for tasks...")
         while True:
-            available = self.semaphore._value
+            result = await self.redis_client.brpop(self.queue_key, timeout=0)
+            if not result:
+                continue
+
+            _, task_id = result
+            self._set_context(task_id[:6])
+            logger.info("Picked up task %s from queue, waiting for capacity...", task_id[:6])
+
+            for sem in self.semaphores:
+                await sem.acquire()
+
+            available = self.semaphores[0]._value
             logger.info(
-                "Waiting for capacity (available slots: %d/%d)",
+                "Acquired capacity (available slots: %d/%d), executing...",
                 available, self.max_concurrent,
             )
-            await self.semaphore.acquire()
-            logger.info("Acquired capacity, checking queue...")
-
-            result = await self.redis_client.brpop(self.queue_key, timeout=0)
-            if result:
-                _, task_id = result
-                logger.info("Picked up task %s from queue", task_id[:6])
-                asyncio.create_task(self._execute_with_semaphore(task_id))
-            else:
-                self.semaphore.release()
+            asyncio.create_task(self._execute_with_semaphore(task_id))
