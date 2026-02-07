@@ -152,25 +152,24 @@ class TaskService:
             )
 
     async def worker(self):
-        """Main loop: acquire concurrency slots, pop from queue, execute."""
+        """Main loop: pop from queue, acquire concurrency slots, execute."""
         self._set_context()
         logger.info("Worker started, waiting for tasks...")
         while True:
+            result = await self.redis_client.brpop(self.queue_key, timeout=0)
+            if not result:
+                continue
+
+            _, task_id = result
+            self._set_context(task_id[:6])
+            logger.info("Picked up task %s from queue, waiting for capacity...", task_id[:6])
+
             for sem in self.semaphores:
                 await sem.acquire()
 
             available = self.semaphores[0]._value
             logger.info(
-                "Acquired capacity (available slots: %d/%d), checking queue...",
+                "Acquired capacity (available slots: %d/%d), executing...",
                 available, self.max_concurrent,
             )
-
-            result = await self.redis_client.brpop(self.queue_key, timeout=0)
-            if result:
-                _, task_id = result
-                self._set_context(task_id[:6])
-                logger.info("Picked up task %s from queue", task_id[:6])
-                asyncio.create_task(self._execute_with_semaphore(task_id))
-            else:
-                for sem in reversed(self.semaphores):
-                    sem.release()
+            asyncio.create_task(self._execute_with_semaphore(task_id))
