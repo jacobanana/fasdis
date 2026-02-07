@@ -27,6 +27,9 @@ HIGH_PRIORITY_RESERVED = int(os.getenv("HIGH_PRIORITY_RESERVED", "1"))
 high_priority: TaskService = None
 low_priority: TaskService = None
 
+# Worker tasks
+worker_tasks = list()
+
 
 async def do_work(task_id: str):
     """The actual work a task performs."""
@@ -56,13 +59,11 @@ async def startup_event():
     low_priority = TaskService(
         priority=Priority.LOW,
         queue_key="low_priority_queue",
-        max_concurrent=MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED,
+        max_concurrent=MAX_CONCURRENT_TASKS - HIGH_PRIORITY_RESERVED, # this technically allows for more than MAX_CONCURRENCY tasks to run at once
         redis_client=redis_client,
         worker_name=WORKER_NAME,
         handler=do_work,
     )
-
-    worker_tasks = []
 
     worker_tasks.append(asyncio.create_task(high_priority.worker()))
     worker_tasks.append(asyncio.create_task(low_priority.worker()))
