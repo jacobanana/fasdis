@@ -8,6 +8,88 @@ Each worker instance runs a FastAPI server with two worker loops — one consumi
 from `high_priority_queue` and one from `low_priority_queue` in Redis. Jobs are
 submitted via HTTP and processed asynchronously with configurable concurrency.
 
+```mermaid
+flowchart TD
+    subgraph Client
+        C1["new task"]
+        C2["poll for result"]
+    end
+
+    subgraph API
+        A1["/task"]
+        A2["/task/{task_id}"]
+    end
+
+    subgraph Redis
+        LPQ["low priority Q"]
+        HPQ["high priority Q"]
+        TR["task records\n{task:task_id}"]
+    end
+
+    subgraph Worker
+        subgraph GS["Global Semaphore — MAX_CONCURRENCY"]
+            HPW["High Priority\nWorker"]
+            subgraph LPS["LP Semaphore — MAX - RESERVE"]
+                LPW["Low Priority\nWorker"]
+            end
+        end
+    end
+
+    C1 -->|POST| A1
+    C2 -->|GET| A2
+    A1 -->|LPQ| LPQ
+    A1 -->|HPQ| HPQ
+    HPQ --> HPW
+    LPQ --> LPW
+    HPW -->|records| TR
+    LPW -->|records| TR
+    A2 <--> TR
+```
+
+### Task Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant R as Redis
+    participant LW as Low Priority Worker
+    participant HW as High Priority Worker
+
+    Note over C,HW: Low Priority Task
+    C->>A: POST /task?priority=low
+    A->>R: HSET task:{id} status=queued
+    A->>R: LPUSH low_priority_queue
+    A-->>C: {task_id, status: queued}
+    LW->>R: BRPOP low_priority_queue
+    R-->>LW: task_id
+    LW->>LW: acquire(low_priority_cap)
+    LW->>LW: acquire(global_sem)
+    LW->>R: HSET task:{id} status=processing
+    LW->>LW: execute handler
+    LW->>R: HSET task:{id} status=completed
+    LW->>LW: release(global_sem, low_priority_cap)
+
+    Note over C,HW: High Priority Task
+    C->>A: POST /task?priority=high
+    A->>R: HSET task:{id} status=queued
+    A->>R: LPUSH high_priority_queue
+    A-->>C: {task_id, status: queued}
+    HW->>R: BRPOP high_priority_queue
+    R-->>HW: task_id
+    HW->>HW: acquire(global_sem)
+    HW->>R: HSET task:{id} status=processing
+    HW->>HW: execute handler
+    HW->>R: HSET task:{id} status=completed
+    HW->>HW: release(global_sem)
+
+    Note over C,HW: Client Polls for Result
+    C->>A: GET /task/{task_id}
+    A->>R: HGETALL task:{id}
+    R-->>A: task record
+    A-->>C: {status: completed, ...}
+```
+
 ## Concurrency & Priority Design
 
 ### Goals
